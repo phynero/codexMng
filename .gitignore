@@ -1,0 +1,7 @@
+data/
+node_modules/
+.env
+.env.*
+.DS_Store
+.tmp-*/
+.artifacts/

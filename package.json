@@ -1,0 +1,22 @@
+{
+  "name": "codex-account-deck",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local Codex account quota dashboard",
+  "engines": {
+    "node": ">=18.15"
+  },
+  "scripts": {
+    "start": "node server/service.mjs start",
+    "dev": "node server/index.mjs",
+    "test": "node --test test/*.test.mjs",
+    "check": "node --check server/index.mjs && node --check server/desktop.mjs && node --check server/desktop-worker.mjs && node --check server/autostart.mjs && node --check server/service.mjs && node --check public/app.js && node --test test/*.test.mjs",
+    "test:cli": "node test/cli-smoke.mjs",
+    "stop": "node server/service.mjs stop",
+    "status": "node server/service.mjs status",
+    "autostart:enable": "node server/autostart.mjs install",
+    "autostart:disable": "node server/autostart.mjs uninstall",
+    "autostart:status": "node server/autostart.mjs status"
+  }
+}

@@ -73,10 +73,18 @@ export async function createApp(options = {}) {
           return json(res, 202, { desktop: await desktop.restore(body.confirmRestart) });
         }
         if (req.method === 'POST' && pathname === '/api/accounts') return json(res, 201, { account: await manager.add(body.name) });
+        if (req.method === 'POST' && pathname === '/api/groups') { await manager.addGroup(body.name); return json(res, 201, manager.state()); }
+        const groupMatch = pathname.match(/^\/api\/groups\/(default|[a-f0-9-]+)$/i);
+        if (groupMatch) {
+          if (req.method === 'PATCH') { await manager.renameGroup(groupMatch[1], body.name); return json(res, 200, manager.state()); }
+          if (req.method === 'DELETE') { await manager.removeGroup(groupMatch[1]); return json(res, 200, manager.state()); }
+          throw new HttpError(405, '不支持的请求方法。');
+        }
         if (req.method === 'POST' && pathname === '/api/refresh') { await manager.refreshAll(); return json(res, 200, await state()); }
-        const match = pathname.match(/^\/api\/accounts\/([a-f0-9-]+)(?:\/(login|cancel-login|refresh|activate))?$/i);
+        const match = pathname.match(/^\/api\/accounts\/([a-f0-9-]+)(?:\/(login|cancel-login|refresh|activate|move))?$/i);
         if (!match) throw new HttpError(404, '接口不存在。');
         const [, id, action] = match;
+        if (req.method === 'POST' && action === 'move') { await manager.move(id, body.groupId, body.beforeId); return json(res, 200, manager.state()); }
         if (req.method === 'POST' && action === 'activate') {
           if (!desktop) throw new HttpError(409, '桌面切换未启用。');
           return json(res, 202, { desktop: await desktop.activate(id, body.confirmRestart) });

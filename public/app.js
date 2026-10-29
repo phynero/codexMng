@@ -2,6 +2,7 @@ import { t, getLanguage, setLanguage, LANGUAGE_KEY, applyTranslations, message, 
 import { remaining, windowLabel, windowPair, isExpired, countdown, accountHealth, nearestResets, formatReset, escapeHtml as esc } from './lib.mjs';
 
 const icons = {
+  grip:'<circle cx="9" cy="5" r="1"/><circle cx="15" cy="5" r="1"/><circle cx="9" cy="12" r="1"/><circle cx="15" cy="12" r="1"/><circle cx="9" cy="19" r="1"/><circle cx="15" cy="19" r="1"/>',
   grid:'<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
   clock:'<circle cx="12" cy="12" r="8.5"/><path d="M12 7v5l3 2"/>',
   shield:'<path d="m12 3 8 3v6c0 4-4 7-8 9-4-2-8-5-8-9V6l8-3Z"/><path d="m8.5 12 2.5 2.5 4.5-5"/>',
@@ -23,12 +24,25 @@ const $ = selector => document.querySelector(selector);
 function hydrateIcons(root = document) { root.querySelectorAll('[data-icon]').forEach(el => { el.innerHTML = icon(el.dataset.icon); }); }
 applyTranslations();
 hydrateIcons();
-let state = { accounts: [], health: {}, pollIntervalMs: 60000 };
+const DEFAULT_GROUP = 'default';
+const GROUP_EXPANDED_KEY = 'codex-deck.groups.expanded';
+function groupStorage() { try { return globalThis.localStorage; } catch { return null; } }
+function readExpandedGroups() { try { const value = JSON.parse(groupStorage()?.getItem(GROUP_EXPANDED_KEY) || '{}'); return value && typeof value === 'object' && !Array.isArray(value) ? value : {}; } catch { return {}; } }
+function saveExpandedGroups() { try { const storage = groupStorage(); if (!storage) return false; storage.setItem(GROUP_EXPANDED_KEY, JSON.stringify(expandedGroups)); return true; } catch { return false; } }
+let expandedGroups = readExpandedGroups();
+let state = { accounts: [], groups: [{ id: DEFAULT_GROUP, name: null }], health: {}, pollIntervalMs: 60000 };
 let loaded = false, disconnected = false, demo = false, demoAccounts = [], filter = 'all', search = '', sort = 'created';
 let editingId = null, formMode = 'add', loginId = null, deletingId = null, signature = '', fetchPending = false, toastTimer;
 let desktopAction = null, desktopSubmitting = false, desktopRefreshing = false;
+let groupMode = 'add', editingGroupId = null, deletingGroupId = null, draggingAccountId = null;
+let organizationPending = false, stateRevision = 0;
 const buckets = new Map(), refreshing = new Set(), expirationRefresh = new Map();
 const accounts = () => demo ? demoAccounts : state.accounts;
+const groups = () => (demo ? [{ id: DEFAULT_GROUP, name: null }] : (state.groups?.length ? state.groups : [{ id: DEFAULT_GROUP, name: null }]));
+function groupTitle(group) { return group.id === DEFAULT_GROUP && !group.name ? t('默认分组') : group.name || t('默认分组'); }
+function groupFor(account) { return groups().find(group => group.id === (account.groupId || DEFAULT_GROUP)) || groups()[0]; }
+function expanded(groupId) { return expandedGroups[groupId] !== false; }
+function toggleGroup(groupId) { expandedGroups[groupId] = !expanded(groupId); const saved = saveExpandedGroups(); render(true); if (!saved) toast(t('无法保存分组展开状态；本次切换仍然生效。'), true); }
 const desktopJobActive = value => ['queued','stopping','applying','restarting'].includes(value?.job?.status);
 function desktopState() {
   return demo ? { supported:true,installed:true,appName:'Codex',running:true,canSwitch:true,canRestore:false,matchedAccountId:demoAccounts[0]?.id,currentAccount:{email:demoAccounts[0]?.email},job:null } : state.desktop;
@@ -65,16 +79,20 @@ async function api(url, method = 'GET', body = {}) {
   } finally { clearTimeout(timer); }
 }
 async function loadState() {
-  if (fetchPending) return;
+  if (fetchPending || organizationPending) return;
   fetchPending = true;
+  const revision = stateRevision;
   try {
-    state = await api('/api/state');
+    const next = await api('/api/state');
+    if (revision !== stateRevision) return;
+    state = next;
     loaded = true; disconnected = false;
     const banner = $('#connection-banner');
     if (state.health.codexAvailable === false) { banner.hidden = false; feedback(banner, '未检测到 Codex CLI。请先安装 Codex CLI，再重新启动本项目；也可设置 CODEX_BIN 指定已有程序的路径。'); }
     else { banner.hidden = true; }
     render(); updateLogin();
   } catch (error) {
+    if (revision !== stateRevision) return;
     disconnected = true;
     $('#connection-banner').hidden = false;
     feedback($('#connection-banner'), error.message);
@@ -121,6 +139,23 @@ function renderDesktop() {
   const blockedReason = !demo && disconnected ? t("本地服务已断开，连接恢复后可切换账号。") : message(desktop.reason);
   $('#desktop-panel').innerHTML = `<div class="desktop-symbol">${icon('monitor')}</div><div class="desktop-details"><div class="desktop-heading"><h2 id="desktop-title">${t("桌面客户端")}</h2><span class="desktop-app-status">${esc(appLabel)}${desktop.appVersion ? ` ${esc(desktop.appVersion)}` : ''} · ${appStatus}${demo ? t(" · 演示") : ''}</span></div><p class="desktop-identity">${t("已保存登录")} <strong title="${esc(identity)}">${esc(identity)}</strong></p><p class="desktop-note">${t("按本机保存的登录信息识别；切换账号会重启客户端。")}</p>${blockedReason ? `<p class="desktop-reason">${esc(blockedReason)}</p>` : ''}${jobText ? `<div class="desktop-job ${job?.status === 'failed' ? 'failed' : job?.status === 'completed' ? 'completed' : ''}" role="status">${busy ? '<span class="spinner"></span>' : icon(job?.status === 'failed' ? 'warning' : 'check')}<span>${esc(jobText)}</span></div>` : ''}</div><div class="desktop-actions"><button class="button secondary desktop-refresh ${desktopRefreshing ? 'spinning' : ''}" data-desktop-action="refresh" ${desktopRefreshing || busy ? 'disabled' : ''}>${icon('refresh')}${t("检测状态")}</button>${desktop.canRestore ? `<button class="text-button desktop-restore" data-desktop-action="restore" ${busy || disconnected || !desktop.canSwitch ? 'disabled' : ''}>${t("恢复上次登录")}</button>` : ''}</div>`;
 }
+function duplicateMarkup(account) {
+  const existing = accounts().find(item => item.id === account.duplicateOf);
+  if (!existing) return '';
+  const label = existing.name === existing.email || !existing.email ? existing.name : `${existing.name} (${existing.email})`;
+  return `<div class="duplicate-details"><span>${esc(t('已存在记录：{name}', { name: label }))}</span><button class="text-button" data-action="show-existing" data-id="${esc(existing.id)}">${t('查看已有账号')}</button><span>${t('若要连接其他账号，请在官方授权页确认登录邮箱。')}</span></div>`;
+}
+function showExistingAccount(id) {
+  const account = accounts().find(item => item.id === id);
+  if (account) { expandedGroups[groupFor(account).id] = true; saveExpandedGroups(); }
+  filter = 'all'; search = ''; $('#search').value = ''; render(true);
+  const row = [...document.querySelectorAll('[data-account-row]')].find(element => element.dataset.accountRow === id);
+  row?.focus({ preventScroll: true });
+  row?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+function groupOptions(account) {
+  return groups().map(group => `<option value="${esc(group.id)}" ${groupFor(account).id === group.id ? 'selected' : ''}>${esc(groupTitle(group))}</option>`).join('');
+}
 function rowMarkup(account, index) {
   const bucket = getBucket(account), [short,week] = windowPair(bucket), health = accountHealth(account), [bg,fg] = colors[index % colors.length];
   const desktop = desktopState();
@@ -130,15 +165,25 @@ function rowMarkup(account, index) {
   const switchButton = account.status === 'connected' ? `<div class="account-switch"><button class="switch-account" data-action="activate" data-id="${esc(account.id)}" title="${esc(switchTitle)}" ${switchDisabled ? 'disabled' : ''}>${icon(isCurrent ? 'check' : 'monitor')}${isCurrent ? t("当前账号") : t("切换到桌面端")}</button></div>` : '';
   const selected = account.rateLimits?.length > 1 ? `<select class="bucket-select" data-account="${esc(account.id)}" aria-label="${esc(t('选择 {name} 的额度类型', { name: account.name }))}">${account.rateLimits.map(b => `<option value="${esc(b.id)}" ${b.id === bucket.id ? 'selected' : ''}>${esc(b.name || b.id)}</option>`).join('')}</select>` : '';
   const action = (act,i,label,cls='') => `<button class="icon-button ${cls}" data-action="${act}" data-id="${esc(account.id)}" title="${label}" aria-label="${label} ${esc(account.name)}" ${refreshing.has(account.id) && act === 'refresh' ? 'disabled' : ''}>${icon(i)}</button>`;
-  return `<tr><td><div class="identity"><span class="avatar" style="background:${bg};color:${fg}">${esc(Array.from(account.name)[0]?.toUpperCase() || 'C')}</span><div class="identity-main"><div class="account-name" title="${esc(account.name)}">${esc(account.name)}</div><div class="account-email" title="${esc(account.email || '')}">${esc(account.email || (health === 'connecting' ? t("正在等待官方授权…") : t("连接后显示账号邮箱")))}</div><span class="plan-badge ${account.planType === 'pro' ? 'pro' : ''}">${esc(account.planType ? account.planType.toUpperCase() : t("未连接"))}</span>${isCurrent ? `<span class="desktop-current-badge" title="${t("根据本机保存的登录信息识别")}">${t("桌面端当前账号")}</span>` : ''}${selected}</div></div></td><td>${quotaMarkup(short,t("5 小时额度"))}</td><td>${quotaMarkup(week,t("每周额度"))}</td><td><span class="status-pill ${health}"><span class="status-dot"></span>${statusNames()[health]}</span><div class="last-updated" data-updated="${esc(account.lastUpdatedAt || '')}">${ago(account.lastUpdatedAt)}</div>${account.error ? `<div class="error-text">${esc(message(account.error))}</div>` : ''}</td><td><div class="row-actions">${action('refresh','refresh',t("刷新额度"),refreshing.has(account.id) ? 'spinning' : '')}${action('edit','edit',t("重命名"))}${action('delete','trash',t("移除账号"),'delete')}</div>${switchButton}<div class="account-connect"><button data-action="connect" data-id="${esc(account.id)}">${health === 'connecting' ? t("继续授权") : health === 'disconnected' || health === 'error' ? t("连接账号") : t("重新连接")}</button></div></td></tr>`;
+  return `<tr data-account-row="${esc(account.id)}" data-group-id="${esc(groupFor(account).id)}" draggable="${!demo && !organizationPending && !disconnected && sort === 'created'}" tabindex="-1"><td><div class="identity"><button class="drag-handle" data-id="${esc(account.id)}" title="${t('拖动排序，或按 Alt+↑／↓ 调整顺序')}" aria-label="${esc(t('调整 {name} 的顺序', { name: account.name }))}" aria-keyshortcuts="Alt+ArrowUp Alt+ArrowDown">${icon('grip')}</button><span class="avatar" style="background:${bg};color:${fg}">${esc(Array.from(account.name)[0]?.toUpperCase() || 'C')}</span><div class="identity-main"><div class="account-name" title="${esc(account.name)}">${esc(account.name)}</div><div class="account-email" title="${esc(account.email || '')}">${esc(account.email || (health === 'connecting' ? t("正在等待官方授权…") : t("连接后显示账号邮箱")))}</div><span class="plan-badge ${account.planType === 'pro' ? 'pro' : ''}">${esc(account.planType ? account.planType.toUpperCase() : t("未连接"))}</span>${isCurrent ? `<span class="desktop-current-badge" title="${t("根据本机保存的登录信息识别")}">${t("桌面端当前账号")}</span>` : ''}${selected}</div></div></td><td>${quotaMarkup(short,t("5 小时额度"))}</td><td>${quotaMarkup(week,t("每周额度"))}</td><td><span class="status-pill ${health}"><span class="status-dot"></span>${account.duplicateOf ? t("重复账号") : statusNames()[health]}</span><div class="last-updated" data-updated="${esc(account.lastUpdatedAt || '')}">${ago(account.lastUpdatedAt)}</div>${account.error ? `<div class="error-text">${esc(message(account.error))}${duplicateMarkup(account)}</div>` : ''}</td><td><div class="row-actions">${action('refresh','refresh',t("刷新额度"),refreshing.has(account.id) ? 'spinning' : '')}${action('edit','edit',t("重命名"))}${action('delete','trash',t("移除账号"),'delete')}</div><label class="account-group-picker"><span>${t('分组')}</span><select data-action="move-group" data-id="${esc(account.id)}" aria-label="${esc(t('{name} 的分组', { name: account.name }))}">${groupOptions(account)}</select></label>${switchButton}<div class="account-connect"><button data-action="connect" data-id="${esc(account.id)}">${health === 'connecting' ? t("继续授权") : health === 'disconnected' || health === 'error' ? t("连接账号") : t("重新连接")}</button></div></td></tr>`;
+}
+function accountTableMarkup(items) {
+  return `<table class="account-table"><thead><tr><th>${t("账号 / 订阅")}</th><th>${t("5 小时额度")} <span class="subtle">${t("/ 剩余")}</span></th><th>${t("每周额度")} <span class="subtle">${t("/ 剩余")}</span></th><th>${t("账号状态")}</th><th>${t("管理")}</th></tr></thead><tbody>${items.map(rowMarkup).join('')}</tbody></table>`;
+}
+function groupMarkup(group, items, total) {
+  const isOpen = expanded(group.id);
+  const deletable = group.id !== DEFAULT_GROUP;
+  return `<section class="account-group ${isOpen ? 'is-open' : 'is-closed'}" data-group="${esc(group.id)}"><header class="group-header" data-group-body="${esc(group.id)}"><button class="group-toggle" data-action="toggle-group" data-id="${esc(group.id)}" aria-expanded="${isOpen}" aria-controls="group-body-${esc(group.id)}"><span class="group-chevron">⌄</span><strong>${esc(groupTitle(group))}</strong><span class="count-badge">${total}</span></button><div class="group-actions"><button class="icon-button" data-action="rename-group" data-id="${esc(group.id)}" title="${t('重命名分组')}" aria-label="${t('重命名分组')} ${esc(groupTitle(group))}">${icon('edit')}</button>${deletable ? `<button class="icon-button delete" data-action="delete-group" data-id="${esc(group.id)}" title="${t('删除分组')}" aria-label="${t('删除分组')} ${esc(groupTitle(group))}">${icon('trash')}</button>` : ''}</div></header><div class="group-body" id="group-body-${esc(group.id)}" data-group-body="${esc(group.id)}" ${isOpen ? '' : 'hidden'}>${items.length ? accountTableMarkup(items) : `<div class="group-empty" data-group-id="${esc(group.id)}">${total ? t('没有符合条件的账号') : t('将账号拖到这里')}</div>`}</div></section>`;
 }
 function render(force = false) {
+  if (draggingAccountId) return;
   const list = accounts();
-  const key = JSON.stringify([getLanguage(),list,filter,search,sort,[...buckets],[...refreshing],demo,list.map(a=>accountHealth(a)),state.desktop,desktopSubmitting,desktopRefreshing,disconnected,loaded]);
+  const key = JSON.stringify([getLanguage(),list,groups(),expandedGroups,organizationPending,filter,search,sort,[...buckets],[...refreshing],demo,list.map(a=>accountHealth(a)),state.desktop,desktopSubmitting,desktopRefreshing,disconnected,loaded]);
   if (!force && signature === key) return;
   signature = key; summary(); renderDesktop();
   $('#demo-banner').hidden = !demo;
   $('#demo-button').hidden = demo;
+  $('#add-group').disabled = demo || organizationPending || disconnected || !loaded;
   $('#sync-label').innerHTML = demo ? `<span class="status-dot green"></span>${t("示例数据 · 仅供预览")}` : disconnected ? t("连接已断开 · 显示上次数据") : `<span class="status-dot green"></span>${t('每{seconds}秒自动同步额度', { seconds: Math.round((state.pollIntervalMs || 60000)/1000) })}`;
   document.querySelectorAll('[data-filter]').forEach(el => el.classList.toggle('active',el.dataset.filter === filter));
   let visible = list.filter(a => (!search || `${a.name} ${a.email || ''}`.toLowerCase().includes(search)) && (filter === 'all' || filter === 'ready' && ['ready','low'].includes(accountHealth(a)) || filter === 'attention' && isAttention(a)));
@@ -153,8 +198,11 @@ function render(force = false) {
     $('#account-content').innerHTML = `<div class="empty-state"><div class="empty-art" aria-hidden="true"><div class="mini-card"></div><div class="mini-card front"><div class="mini-avatar"></div><div class="mini-lines"><i></i><i></i></div></div><span>+</span></div><h3>${t("从你的第一个账号开始")}</h3><p>${t("连接 Codex 账号，实时查看 5 小时与每周额度。")}<br>${t("所有账号、所有重置时间，在这里一览。")}</p><div class="empty-actions"><button class="button primary" data-action="add">${icon('plus')}${t("添加第一个账号")}</button><button class="button secondary" data-action="demo">${t("先看一下演示")} ${icon('arrow')}</button></div></div>`;
   } else if (!visible.length) {
     $('#account-content').innerHTML = `<div class="no-results">${t("没有符合条件的账号")}<br><button class="text-button" data-action="clear-filter">${t("清除筛选条件")}</button></div>`;
-  } else {
-    $('#account-content').innerHTML = `<table class="account-table"><thead><tr><th>${t("账号 / 订阅")}</th><th>${t("5 小时额度")} <span class="subtle">${t("/ 剩余")}</span></th><th>${t("每周额度")} <span class="subtle">${t("/ 剩余")}</span></th><th>${t("账号状态")}</th><th>${t("管理")}</th></tr></thead><tbody>${visible.map(rowMarkup).join('')}</tbody></table>`;
+  } else $('#account-content').innerHTML = '';
+  if (loaded || demo) {
+    const groupsForView = groups().map(group => ({ group, items: visible.filter(account => groupFor(account).id === group.id), total: list.filter(account => groupFor(account).id === group.id).length }));
+    $('#account-content').insertAdjacentHTML('beforeend', `<div class="group-list">${groupsForView.map(({ group, items, total }) => groupMarkup(group, items, total)).join('')}</div>`);
+    $('#account-content').querySelectorAll('[data-action="move-group"], [data-action="rename-group"], [data-action="delete-group"], .drag-handle, [data-action="move-up"], [data-action="move-down"]').forEach(element => { element.disabled = demo || organizationPending || disconnected || (element.matches('.drag-handle') && sort !== 'created'); });
   }
   const resets = nearestResets(list).slice(0,3);
   $('#timeline').innerHTML = resets.length ? resets.map(({account,bucket,window}) => `<div class="timeline-entry"><span class="timeline-marker"></span><div class="timeline-info"><div class="timeline-name"><strong>${esc(account.name)}</strong><span>${esc(windowLabel(window,''))}${account.rateLimits.length > 1 ? ` · ${esc(bucket.name)}` : ''}</span></div><div class="timeline-time">${t('{time} 重置', { time: formatReset(window.resetsAt) })}</div></div><span class="timeline-countdown" data-reset="${window.resetsAt}">${countdown(window.resetsAt)}</span></div>`).join('') : `<div class="timeline-empty">${icon('clock')}<span>${list.length ? t("暂时没有待重置的额度窗口") : t("连接账号后，自动排列最近的重置时间")}</span></div>`;
@@ -260,12 +308,15 @@ function updateLogin(force = false) {
   if (!loginId) return;
   const account = state.accounts.find(a => a.id === loginId);
   if (!account) { $('#login-dialog').close(); loginId = null; return; }
-  const key = JSON.stringify([getLanguage(),account.name,account.status,account.login,account.error]);
+  const key = JSON.stringify([getLanguage(),account.name,account.status,account.login,account.error,account.duplicateOf,state.accounts.find(item => item.id === account.duplicateOf)?.name]);
   if (!force && key === loginSignature) return; loginSignature = key;
   const login = account.login;
   const url = safeLoginUrl(login?.authUrl || login?.verificationUrl);
-  $('#login-content').innerHTML = account.status === 'connecting' ? `<h2>${t("完成官方登录")}</h2><p class="login-hint">${t('正在连接「{name}」。在官方授权页登录你要添加的账号，完成后此处自动更新。', { name: esc(account.name) })}</p>${login?.userCode ? `<div class="login-code">${esc(login.userCode)}</div><p class="login-hint">${t("在官方页面输入上方设备验证码。若不可用，请在 ChatGPT 安全设置中开启 Codex 设备码登录，或切换浏览器登录。")}</p>` : ''}<div class="login-status"><span class="spinner"></span>${t("等待账号授权…")}</div>${url ? `<a class="button primary login-open" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${t("打开官方授权页")} ${icon('external')}</a>` : `<p class="login-hint">${t("正在准备登录链接…")}</p>`}<p class="login-hint">${t("添加其他账号时，先确认官方页面选择的账号正确。可以使用无痕窗口登录。关闭此窗口后仍可在账号行继续授权。")}</p><div class="modal-actions"><button class="button secondary" id="cancel-login">${t("取消本次登录")}</button><button class="button secondary" id="hide-login">${t("稍后继续")}</button></div>` : account.status === 'connected' ? `<h2>${t("账号已连接")}</h2><div class="login-status">${icon('check')}${t('已连接 {name}', { name: esc(account.email || account.name) })}</div><p class="login-hint">${t("额度已经同步，接下来每分钟自动更新。")}</p><div class="modal-actions"><button class="button primary" id="hide-login">${t("查看账号")}</button></div>` : `<h2>${t("登录未完成")}</h2><p class="login-hint">${esc(message(account.error) || t("请重新发起登录。"))}</p><div class="modal-actions"><button class="button secondary" id="hide-login">${t("关闭")}</button><button class="button primary" id="retry-login">${t("重新登录")}</button></div>`;
+  $('#login-content').innerHTML = account.status === 'connecting' ? `<h2>${t("完成官方登录")}</h2><p class="login-hint">${t('正在连接「{name}」。在官方授权页登录你要添加的账号，完成后此处自动更新。', { name: esc(account.name) })}</p>${login?.userCode ? `<div class="login-code">${esc(login.userCode)}</div><p class="login-hint">${t("在官方页面输入上方设备验证码。若不可用，请在 ChatGPT 安全设置中开启 Codex 设备码登录，或切换浏览器登录。")}</p>` : ''}<div class="login-status"><span class="spinner"></span>${t("等待账号授权…")}</div>${url ? `<a class="button primary login-open" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${t("打开官方授权页")} ${icon('external')}</a>` : `<p class="login-hint">${t("正在准备登录链接…")}</p>`}<p class="login-hint">${t("添加其他账号时，先确认官方页面选择的账号正确。可以使用无痕窗口登录。关闭此窗口后仍可在账号行继续授权。")}</p><div class="modal-actions"><button class="button secondary" id="cancel-login">${t("取消本次登录")}</button><button class="button secondary" id="hide-login">${t("稍后继续")}</button></div>` : account.status === 'connected' ? `<h2>${t("账号已连接")}</h2><div class="login-status">${icon('check')}${t('已连接 {name}', { name: esc(account.email || account.name) })}</div><p class="login-hint">${t("额度已经同步，接下来每分钟自动更新。")}</p><div class="modal-actions"><button class="button primary" id="hide-login">${t("查看账号")}</button></div>` : `<h2>${t("登录未完成")}</h2><p class="login-hint">${esc(message(account.error) || t("请重新发起登录。"))}</p>${duplicateMarkup(account)}<div class="modal-actions"><button class="button secondary" id="hide-login">${t("关闭")}</button><button class="button primary" id="retry-login">${t("重新登录")}</button></div>`;
   $('#hide-login')?.addEventListener('click',()=>$('#login-dialog').close());
+  $('#login-content [data-action="show-existing"]')?.addEventListener('click', event => {
+    $('#login-dialog').close(); showExistingAccount(event.currentTarget.dataset.id);
+  });
   $('#retry-login')?.addEventListener('click',()=>{ $('#login-dialog').close(); openAccount('connect',account); });
   $('#cancel-login')?.addEventListener('click', async event => {
     event.currentTarget.disabled = true;
@@ -297,7 +348,14 @@ $('#account-content').addEventListener('click',event => {
   if (action === 'add') return openAccount();
   if (action === 'demo') return startDemo();
   if (action === 'clear-filter') { filter = 'all'; search = ''; $('#search').value = ''; return render(true); }
+  if (action === 'toggle-group') return toggleGroup(id);
+  if (action === 'rename-group') return openGroup('edit', id);
+  if (action === 'delete-group') {
+    const group = groups().find(item => item.id === id); if (!group || id === DEFAULT_GROUP) return;
+    deletingGroupId = id; $('#group-delete-description').textContent = t('删除「{name}」？组内账号会移回默认分组。', { name: groupTitle(group) }); showModal('#group-delete-dialog'); return;
+  }
   const account = accounts().find(a=>a.id===id); if (!account) return;
+  if (action === 'show-existing') return showExistingAccount(id);
   if (action === 'activate') return openDesktopAction('activate',account);
   if (demo) return toast(t("演示模式仅供查看。返回我的账号后即可管理。"));
   if (action === 'refresh') return refreshAccount(id);
@@ -308,11 +366,101 @@ $('#account-content').addEventListener('click',event => {
     showModal('#delete-dialog');
   }
 });
-$('#account-content').addEventListener('change',event => { if (event.target.matches('.bucket-select')) { buckets.set(event.target.dataset.account,event.target.value); render(true); } });
+async function moveAccount(id, groupId, beforeId = null) {
+  if (demo) return toast(t('演示模式仅供查看。返回我的账号后即可管理。'), true);
+  try { await organize(`/api/accounts/${encodeURIComponent(id)}/move`, 'POST', { groupId, beforeId }); toast(t('账号分组和顺序已更新')); }
+  catch (error) { render(true); toast(error.message, true); }
+}
+async function organize(url, method, body = {}) {
+  if (organizationPending) throw new Error(t('正在保存，请稍候。'));
+  organizationPending = true; stateRevision++; render(true);
+  try {
+    const next = await api(url, method, body);
+    state = { ...state, ...next }; stateRevision++;
+    loaded = true; disconnected = false;
+  } finally { organizationPending = false; render(true); updateLogin(true); }
+}
+$('#account-content').addEventListener('change',event => {
+  if (event.target.matches('.bucket-select')) { buckets.set(event.target.dataset.account,event.target.value); render(true); }
+  if (event.target.matches('[data-action="move-group"]')) void moveAccount(event.target.dataset.id, event.target.value);
+});
+$('#account-content').addEventListener('dragstart', event => {
+  const row = event.target.closest('[data-account-row]');
+  if (!row || demo || organizationPending || disconnected || sort !== 'created' || (event.target.closest('button,select,input,a') && !event.target.closest('.drag-handle'))) { event.preventDefault(); return; }
+  draggingAccountId = row.dataset.accountRow; row.classList.add('dragging');
+  event.dataTransfer.effectAllowed = 'move'; event.dataTransfer.setData('text/plain', draggingAccountId);
+});
+$('#account-content').addEventListener('dragover', event => {
+  const target = event.target.closest('[data-account-row], [data-group-body]');
+  if (!target || !draggingAccountId || demo) return;
+  event.preventDefault(); event.dataTransfer.dropEffect = 'move';
+  document.querySelectorAll('.drag-over').forEach(element => element.classList.remove('drag-over'));
+  target.classList.add('drag-over');
+});
+$('#account-content').addEventListener('dragleave', event => { event.target.closest('[data-account-row], [data-group-body]')?.classList.remove('drag-over'); });
+$('#account-content').addEventListener('drop', event => {
+  const target = event.target.closest('[data-account-row], [data-group-body]');
+  if (!target || !draggingAccountId || demo) return;
+  event.preventDefault();
+  const targetRow = target.matches('[data-account-row]') ? target : null;
+  const groupId = targetRow?.dataset.groupId || target.dataset.groupBody;
+  const id = draggingAccountId;
+  if (targetRow?.dataset.accountRow === id) { endDrag(); return; }
+  let beforeId = targetRow?.dataset.accountRow || null;
+  if (targetRow && event.clientY > targetRow.getBoundingClientRect().top + targetRow.getBoundingClientRect().height / 2) {
+    const siblings = accounts().filter(account => groupFor(account).id === groupId && account.id !== id);
+    const index = siblings.findIndex(account => account.id === beforeId);
+    beforeId = siblings[index + 1]?.id || null;
+  }
+  document.querySelectorAll('.drag-over,.dragging').forEach(element => element.classList.remove('drag-over','dragging'));
+  draggingAccountId = null; void moveAccount(id, groupId, beforeId);
+});
+function endDrag() { draggingAccountId = null; document.querySelectorAll('.drag-over,.dragging').forEach(element => element.classList.remove('drag-over','dragging')); render(true); }
+$('#account-content').addEventListener('dragend', endDrag);
+$('#account-content').addEventListener('keydown', async event => {
+  if (!event.target.matches('.drag-handle') || !event.altKey || !['ArrowUp', 'ArrowDown'].includes(event.key) || sort !== 'created' || organizationPending) return;
+  event.preventDefault();
+  const id = event.target.dataset.id, account = accounts().find(item => item.id === id); if (!account) return;
+  const groupId = groupFor(account).id, siblings = accounts().filter(item => groupFor(item).id === groupId);
+  const index = siblings.findIndex(item => item.id === id);
+  if ((event.key === 'ArrowUp' && index === 0) || (event.key === 'ArrowDown' && index === siblings.length - 1)) return;
+  await moveAccount(id, groupId, event.key === 'ArrowUp' ? siblings[index - 1].id : siblings[index + 2]?.id || null);
+  [...document.querySelectorAll('.drag-handle')].find(item => item.dataset.id === id)?.focus();
+});
 $('#confirm-delete').addEventListener('click',async event => {
   const button = event.currentTarget; button.disabled = true;
   try { await api(`/api/accounts/${deletingId}`,'DELETE'); $('#delete-dialog').close(); toast(t("账号及本地登录记录已移除")); await loadState(); }
   catch(error) { toast(error.message,true); }
+  finally { button.disabled = false; }
+});
+function openGroup(mode = 'add', groupId = null) {
+  if (demo || organizationPending) return;
+  groupMode = mode; editingGroupId = groupId; $('#group-form').reset(); $('#group-form-error').hidden = true;
+  const group = groups().find(item => item.id === groupId);
+  $('#group-name').value = mode === 'edit' && group ? groupTitle(group) : '';
+  renderGroupForm();
+  showModal('#group-dialog');
+}
+function renderGroupForm() {
+  $('#group-dialog-title').textContent = groupMode === 'edit' ? t('重命名分组') : t('新建分组');
+  $('#group-dialog-description').textContent = groupMode === 'edit' ? t('修改这个分组的名称，组内账号不会改变。') : t('给一组账号起一个便于识别的名称。');
+  $('#group-submit').textContent = groupMode === 'edit' ? t('保存分组名称') : t('创建分组');
+}
+$('#add-group').addEventListener('click', () => openGroup());
+$('#group-form').addEventListener('submit', async event => {
+  event.preventDefault(); const button = $('#group-submit'); button.disabled = true; $('#group-form-error').hidden = true;
+  try {
+    const name = $('#group-name').value.trim();
+    if (groupMode === 'edit') await organize(`/api/groups/${encodeURIComponent(editingGroupId)}`, 'PATCH', { name });
+    else await organize('/api/groups', 'POST', { name });
+    $('#group-dialog').close(); toast(t('分组已更新'));
+  } catch (error) { feedback($('#group-form-error'), error.message); $('#group-form-error').hidden = false; }
+  finally { button.disabled = false; }
+});
+$('#confirm-group-delete').addEventListener('click', async event => {
+  if (!deletingGroupId) return; const button = event.currentTarget; button.disabled = true;
+  try { await organize(`/api/groups/${encodeURIComponent(deletingGroupId)}`, 'DELETE'); delete expandedGroups[deletingGroupId]; saveExpandedGroups(); $('#group-delete-dialog').close(); deletingGroupId = null; toast(t('分组已删除，账号已移回默认分组')); }
+  catch (error) { toast(error.message, true); }
   finally { button.disabled = false; }
 });
 const demoNameKeys = ['主力开发账号', '工作账号', '备用账号', '实验室账号'];
@@ -364,6 +512,9 @@ function changeLanguage(value, persist = true) {
   renderSwitchDialog();
   const deleting = state.accounts.find(account => account.id === deletingId);
   if (deleting) $('#delete-description').textContent = t('你将从管理面板移除「{name}」。', { name: deleting.name });
+  const deletingGroup = groups().find(group => group.id === deletingGroupId);
+  if (deletingGroup) $('#group-delete-description').textContent = t('删除「{name}」？组内账号会移回默认分组。', { name: groupTitle(deletingGroup) });
+  if ($('#group-dialog').open) renderGroupForm();
   document.querySelectorAll('[data-feedback-source]').forEach(element => { element.textContent = message(element.dataset.feedbackSource); });
   $('#toast').hidden = true;
   if (!saved) toast(t('无法保存语言偏好；本次切换仍然生效。'), true);
@@ -371,5 +522,6 @@ function changeLanguage(value, persist = true) {
 $('#language-select').addEventListener('change', event => changeLanguage(event.target.value));
 window.addEventListener('storage', event => {
   if (event.key === LANGUAGE_KEY || event.key === null) changeLanguage(event.newValue, false);
+  if (event.key === GROUP_EXPANDED_KEY || event.key === null) { expandedGroups = readExpandedGroups(); render(true); }
 });
 summary(); void loadState();

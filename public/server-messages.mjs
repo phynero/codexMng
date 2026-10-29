@@ -1,6 +1,12 @@
 // Translate only messages supplied by the API. Account names and other user
 // content must never be passed through this function.
 export const serverMessages = Object.freeze({
+  '分组名称须为 1–40 个字符。': 'Group names must contain 1–40 characters.',
+  '分组不存在，请刷新页面。': 'Group not found. Refresh the page.',
+  '分组名称已存在。': 'A group with this name already exists.',
+  '最多创建 50 个分组。': 'You can create up to 50 groups.',
+  '默认分组不能删除。': 'The default group cannot be deleted.',
+  '账号位置已变化，请刷新后重试。': 'The account position has changed. Refresh and try again.',
   '账号名称须为 1–60 个字符。': 'Account names must contain 1–60 characters.',
   'Codex 返回了无效的登录地址，请更新 Codex CLI 后重试。': 'Codex returned an invalid sign-in URL. Update Codex CLI and try again.',
   '账号不存在。': 'Account not found.',

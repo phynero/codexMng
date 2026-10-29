@@ -102,12 +102,90 @@ test('shared desktop monitoring uses access-token-only sessions and refreshes wh
 
 test('duplicate identities are stopped before starting another refresh-capable session', async () => {
   const f = await fixture(); try {
-    await f.add('target'); const duplicate = await f.add('target');
+    const original = await f.add('target'); const duplicate = await f.add('target');
     assert.equal(f.app.manager.get(duplicate.id).status, 'error');
     assert.match(f.app.manager.get(duplicate.id).error, /列表中/);
+    assert.equal(f.app.manager.get(duplicate.id).duplicateOf, original.id);
     assert.equal(f.app.manager.adapters.has(duplicate.id), false);
     await assert.rejects(f.app.desktop.activate(duplicate.id, true), error => error.status === 409);
     assert.equal(f.dispatches.length, 0);
+  } finally { await f.cleanup(); }
+});
+
+test('duplicate login exposes its actual email and existing entry instead of stale account data', async () => {
+  const f = await fixture(); try {
+    const existing = await f.add('target');
+    const changed = await f.add('old-user');
+    assert.ok(f.app.manager.get(changed.id).rateLimits.length);
+    await writePrivate(path.join(f.app.manager.accountHome(changed.id), 'auth.json'), auth('target', 3));
+    const duplicate = await f.app.manager.refresh(changed.id);
+    assert.equal(duplicate.name, 'old-user');
+    assert.equal(duplicate.email, 'target@example.invalid');
+    assert.equal(duplicate.duplicateOf, existing.id);
+    assert.equal(duplicate.status, 'error');
+    assert.deepEqual(duplicate.rateLimits, []);
+    assert.equal(duplicate.lastUpdatedAt, null);
+    assert.equal(f.app.manager.adapters.has(changed.id), false);
+    const overview = await (await fetch(`${f.url}/api/state`)).json();
+    assert.equal(overview.accounts.find(a => a.id === changed.id).duplicateOf, existing.id);
+    assert.ok(!JSON.stringify(overview).includes('secret-refresh'));
+  } finally { await f.cleanup(); }
+});
+
+test('removing the earlier duplicate starts a new check for the retained entry', async () => {
+  const f = await fixture(); try {
+    const first = await f.add('target');
+    const retained = await f.add('target');
+    assert.equal(f.app.manager.get(retained.id).status, 'error');
+    await f.app.manager.remove(first.id);
+    assert.ok(f.app.manager.refreshes.has(retained.id));
+    await f.app.manager.refresh(retained.id);
+    const account = f.app.manager.get(retained.id);
+    assert.equal(account.status, 'connected');
+    assert.equal(account.duplicateOf, null);
+    assert.ok(account.rateLimits.length);
+    assert.equal(await readPrivate(path.join(f.app.manager.accountHome(first.id), 'auth.json'), { optional: true }), null);
+    assert.ok(f.app.manager.adapters.has(retained.id));
+  } finally { await f.cleanup(); }
+});
+test('manual ordering cannot change which duplicate owns the monitoring session', async () => {
+  const f = await fixture(); try {
+    const first = await f.add('target'), duplicate = await f.add('target');
+    const monitor = f.app.manager.adapters.get(first.id);
+    await f.app.manager.move(duplicate.id, 'default', first.id);
+    assert.equal(f.app.manager.state().accounts[0].id, duplicate.id);
+    await f.app.manager.refreshAll();
+    assert.equal(f.app.manager.get(duplicate.id).duplicateOf, first.id);
+    assert.equal(f.app.manager.get(first.id).status, 'connected');
+    assert.equal(f.app.manager.adapters.get(first.id), monitor);
+    assert.equal(f.app.manager.adapters.has(duplicate.id), false);
+  } finally { await f.cleanup(); }
+});
+
+test('deleting duplicate records removes their credentials and allows the same identity after restart', async () => {
+  const f = await fixture(); try {
+    const first = await f.add('target');
+    const duplicate = await f.add('target');
+    await f.app.manager.remove(duplicate.id);
+    await f.app.manager.remove(first.id);
+    assert.deepEqual(f.app.manager.state().accounts, []);
+    assert.equal(f.app.manager.adapters.size, 0);
+    for (const id of [first.id, duplicate.id]) {
+      assert.equal(await readPrivate(path.join(f.app.manager.accountHome(id), 'auth.json'), { optional: true }), null);
+    }
+    const metadata = JSON.parse(await readFile(f.app.manager.metadataPath, 'utf8'));
+    assert.deepEqual(metadata.accounts, []);
+    const again = await f.add('target');
+    assert.equal(f.app.manager.get(again.id).status, 'connected');
+    await f.app.close();
+    const { AccountManager } = await import('../server/accounts.mjs');
+    const restored = await new AccountManager({ dataDir: f.app.manager.dataDir, pollIntervalMs: 0, health: { codexAvailable: true }, adapterFactory: options => new Adapter(options) }).init();
+    try {
+      await restored.startup;
+      assert.equal(restored.state().accounts.length, 1);
+      assert.equal(restored.get(again.id).status, 'connected');
+      assert.equal(restored.get(again.id).duplicateOf, null);
+    } finally { await restored.close(); }
   } finally { await f.cleanup(); }
 });
 

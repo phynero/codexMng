@@ -12,6 +12,11 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{1
 const stringOrNull = value => typeof value === 'string' ? value.slice(0, 512) : null;
 const finiteOrNull = value => typeof value === 'number' && Number.isFinite(value) ? value : null;
 const clamp = value => Math.min(100, Math.max(0, value));
+export const DEFAULT_GROUP = 'default';
+function validateGroupName(value) {
+  if (typeof value !== 'string' || !value.trim() || value.trim().length > 40 || /[\u0000-\u001f\u007f]/.test(value)) throw new HttpError(400, '分组名称须为 1–40 个字符。');
+  return value.trim();
+}
 
 export function normalizeWindow(window) {
   if (!window || typeof window !== 'object') return null;
@@ -48,6 +53,9 @@ function publicAccount(account) {
   return {
     id: account.id, name: account.name, email: account.email, planType: account.planType,
     status: account.status, error: account.error, lastUpdatedAt: account.lastUpdatedAt,
+    duplicateOf: account.duplicateOf ?? null,
+    groupId: account.groupId ?? DEFAULT_GROUP,
+    order: account.order ?? 0,
     createdAt: account.createdAt, rateLimits: account.rateLimits,
     login: account.login ? { ...account.login } : null,
   };
@@ -73,6 +81,7 @@ export class AccountManager {
     this.suspended = false;
     this.pollIntervalMs = pollIntervalMs;
     this.accounts = new Map();
+    this.groups = new Map([[DEFAULT_GROUP, { id: DEFAULT_GROUP, name: null }]]);
     this.adapters = new Map();
     this.refreshes = new Map();
     this.activeLogin = null;
@@ -89,6 +98,16 @@ export class AccountManager {
     try {
       const saved = JSON.parse(await readFile(this.metadataPath, 'utf8'));
       if (saved.version !== 1 || !Array.isArray(saved.accounts)) throw new Error('Invalid metadata');
+      if (saved.groups !== undefined) {
+        if (!Array.isArray(saved.groups)) throw new Error('Invalid groups');
+        const groups = new Map();
+        for (const group of saved.groups) {
+          if ((!UUID.test(group.id) && group.id !== DEFAULT_GROUP) || groups.has(group.id)) throw new Error('Invalid group ID');
+          groups.set(group.id, { id: group.id, name: group.id === DEFAULT_GROUP && group.name === null ? null : validateGroupName(group.name) });
+        }
+        if (!groups.has(DEFAULT_GROUP)) groups.set(DEFAULT_GROUP, { id: DEFAULT_GROUP, name: null });
+        this.groups = groups;
+      }
       for (const item of saved.accounts) {
         if (!UUID.test(item.id) || this.accounts.has(item.id)) throw new Error('Invalid account ID');
         const rateLimits = Array.isArray(item.rateLimits) ? item.rateLimits.map(bucket => ({
@@ -98,6 +117,8 @@ export class AccountManager {
         this.accounts.set(item.id, {
           id: item.id, name: validateName(item.name), email: stringOrNull(item.email), planType: stringOrNull(item.planType),
           status: item.email ? 'connected' : 'disconnected', error: null, login: null,
+          groupId: this.groups.has(item.groupId) ? item.groupId : DEFAULT_GROUP,
+          order: Number.isSafeInteger(item.order) && item.order >= 0 ? item.order : this.accounts.size,
           lastUpdatedAt: stringOrNull(item.lastUpdatedAt), createdAt: stringOrNull(item.createdAt) ?? new Date().toISOString(), rateLimits,
         });
         await this.prepareHome(item.id);
@@ -144,17 +165,21 @@ export class AccountManager {
 
   state() {
     return {
-      accounts: [...this.accounts.values()].map(publicAccount),
+      accounts: this.orderedAccounts().map(publicAccount),
+      groups: [...this.groups.values()].map(group => ({ ...group })),
       health: { ...this.health, activeLoginAccountId: this.activeLogin?.account.id ?? null },
       pollIntervalMs: this.pollIntervalMs,
     };
   }
 
+  orderedAccounts() { return [...this.accounts.values()].sort((a, b) => a.order - b.order); }
+
   persist() {
-    const snapshot = JSON.stringify({ version: 1, accounts: [...this.accounts.values()].map(account => {
+    const snapshot = JSON.stringify({ version: 1, groups: [...this.groups.values()], accounts: [...this.accounts.values()].map(account => {
       const saved = publicAccount(account);
       delete saved.login;
       delete saved.error;
+      delete saved.duplicateOf;
       return saved;
     }) }, null, 2);
     const next = this.persistQueue.catch(() => {}).then(async () => {
@@ -171,7 +196,8 @@ export class AccountManager {
     const validName = validateName(name);
     if (this.accounts.size >= 100) throw new HttpError(400, '最多管理 100 个账号。');
     const id = randomUUID();
-    const account = { id, name: validName, email: null, planType: null, status: 'disconnected', error: null, lastUpdatedAt: null, createdAt: new Date().toISOString(), rateLimits: [], login: null };
+    const order = Math.max(-1, ...[...this.accounts.values()].map(account => account.order)) + 1;
+    const account = { id, name: validName, groupId: DEFAULT_GROUP, order, email: null, planType: null, status: 'disconnected', error: null, lastUpdatedAt: null, createdAt: new Date().toISOString(), rateLimits: [], login: null };
     await this.prepareHome(id);
     this.accounts.set(id, account);
     await this.persist();
@@ -185,27 +211,107 @@ export class AccountManager {
     return publicAccount(account);
   }
 
+  group(id) {
+    const group = this.groups.get(id);
+    if (!group) throw new HttpError(404, '分组不存在，请刷新页面。');
+    return group;
+  }
+
+  groupName(name, exceptId = null) {
+    const valid = validateGroupName(name);
+    if ([...this.groups.values()].some(group => group.id !== exceptId && (group.name === null ? ['默认分组', 'default group'].includes(valid.toLowerCase()) : group.name.toLowerCase() === valid.toLowerCase()))) throw new HttpError(409, '分组名称已存在。');
+    return valid;
+  }
+
+  async addGroup(name) {
+    if (this.groups.size >= 50) throw new HttpError(400, '最多创建 50 个分组。');
+    const group = { id: randomUUID(), name: this.groupName(name) };
+    this.groups.set(group.id, group);
+    await this.persist();
+    return { ...group };
+  }
+
+  async renameGroup(id, name) {
+    const group = this.group(id);
+    group.name = this.groupName(name, id);
+    await this.persist();
+    return { ...group };
+  }
+
+  async removeGroup(id) {
+    this.group(id);
+    if (id === DEFAULT_GROUP) throw new HttpError(400, '默认分组不能删除。');
+    for (const account of this.accounts.values()) if (account.groupId === id) account.groupId = DEFAULT_GROUP;
+    this.groups.delete(id);
+    await this.persist();
+  }
+
+  async move(id, groupId, beforeId = null) {
+    const account = this.get(id);
+    this.group(groupId);
+    if (beforeId !== null) {
+      const before = this.accounts.get(beforeId);
+      if (!before || before.groupId !== groupId) throw new HttpError(409, '账号位置已变化，请刷新后重试。');
+      if (beforeId === id) return;
+    }
+    const list = this.orderedAccounts().filter(item => item !== account);
+    let index;
+    if (beforeId !== null) index = list.findIndex(item => item.id === beforeId);
+    else {
+      index = list.length;
+      for (let i = list.length - 1; i >= 0; i--) if (list[i].groupId === groupId) { index = i + 1; break; }
+    }
+    account.groupId = groupId;
+    list.splice(index, 0, account);
+    // Presentation order is independent of creation order, which selects the
+    // canonical monitor when credentials appear in more than one record.
+    list.forEach((item, order) => { item.order = order; });
+    await this.persist();
+  }
+
   async adapter(account, { login = false } = {}) {
+    const assertPresent = () => {
+      if (this.closed || this.accounts.get(account.id) !== account) throw new HttpError(404, '账号不存在。');
+    };
+    assertPresent();
     if (!login) {
       const identity = authIdentity(await readPrivate(path.join(this.accountHome(account.id), 'auth.json'), { optional: true }));
+      assertPresent();
+      // A reconnect can select a different login. Never keep the old email and
+      // quota attached to the credentials of the newly selected account.
+      if (identity?.email) {
+        if (account.email?.toLowerCase() !== identity.email.toLowerCase()) {
+          account.rateLimits = [];
+          account.lastUpdatedAt = null;
+          account.planType = stringOrNull(identity.planType);
+        }
+        account.email = stringOrNull(identity.email);
+      }
       for (const other of this.accounts.values()) {
         if (other.id === account.id) break;
-        if (sameIdentity(identity, authIdentity(await readPrivate(path.join(this.accountHome(other.id), 'auth.json'), { optional: true })))) {
+        const otherIdentity = authIdentity(await readPrivate(path.join(this.accountHome(other.id), 'auth.json'), { optional: true }));
+        assertPresent();
+        if (this.accounts.get(other.id) === other && sameIdentity(identity, otherIdentity)) {
           const adapter = this.adapters.get(account.id);
           this.adapters.delete(account.id);
           await adapter?.close();
           const error = new Error('Duplicate account identity');
           error.publicMessage = '此账号已在列表中，请保留一条记录，或连接不同账号。';
+          error.duplicateOf = other.id;
           throw error;
         }
       }
     }
     const externalAuth = login ? null : await this.externalAuthProvider?.(account.id);
+    // Deletion may have completed while the credential provider was awaiting I/O.
+    // Do not create a process that could recreate a deleted account directory.
+    assertPresent();
     const authKey = externalAuth ? fingerprint(externalAuth) : 'managed';
     let adapter = this.adapters.get(account.id);
     if (adapter && adapter.authKey !== authKey) {
       this.adapters.delete(account.id);
       await adapter.close();
+      assertPresent();
       adapter = null;
     }
     if (!adapter) {
@@ -223,7 +329,7 @@ export class AccountManager {
         account.error = 'Codex 连接已中断，请刷新或重新登录。';
       });
     }
-    try { await adapter.start(); } catch (error) {
+    try { await adapter.start(); assertPresent(); } catch (error) {
       if (this.adapters.get(account.id) === adapter) this.adapters.delete(account.id);
       await adapter.close();
       throw error;
@@ -267,6 +373,7 @@ export class AccountManager {
     this.activeLogin = attempt;
     account.status = 'connecting';
     account.error = null;
+    account.duplicateOf = null;
     try {
       await this.refreshes.get(id);
       if (this.activeLogin !== attempt) throw new HttpError(409, '登录已取消。');
@@ -332,6 +439,7 @@ export class AccountManager {
 
   async fetchAccount(account) {
     const present = () => !this.closed && this.accounts.get(account.id) === account;
+    account.duplicateOf = null;
     try {
       const adapter = await this.adapter(account);
       const result = await adapter.request('account/read', { refreshToken: false });
@@ -358,6 +466,11 @@ export class AccountManager {
       if (present()) {
         account.status = error.authRequired ? 'disconnected' : 'error';
         account.error = error.publicMessage || (error.authRequired ? '登录已失效，请重新登录。' : '读取额度失败，已保留上次数据。请检查网络后刷新。');
+        account.duplicateOf = error.duplicateOf ?? null;
+        if (account.duplicateOf) {
+          account.rateLimits = [];
+          account.lastUpdatedAt = null;
+        }
       }
     }
     if (present()) await this.persist();
@@ -378,15 +491,20 @@ export class AccountManager {
   }
 
   async remove(id) {
-    this.get(id);
-    if (this.activeLogin?.account.id === id) await this.cancelLogin(id);
+    const account = this.get(id);
+    const cancellation = this.activeLogin?.account === account ? this.cancelLogin(id) : Promise.resolve();
+    // Remove from discovery before yielding, including while canceling a login.
     this.accounts.delete(id);
     const adapter = this.adapters.get(id);
     this.adapters.delete(id);
-    await adapter?.close();
+    await Promise.all([cancellation, adapter?.close()]);
     await this.refreshes.get(id)?.catch(() => {});
     await this.persist();
     await rm(this.accountHome(id), { recursive: true, force: true });
+    // Recheck retained duplicates without tying successful deletion to network I/O.
+    for (const other of this.accounts.values()) {
+      if (other.duplicateOf === id) void this.refresh(other.id).catch(() => {});
+    }
   }
 
   async suspend() {
